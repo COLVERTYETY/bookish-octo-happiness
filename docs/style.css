@@ -1,0 +1,81 @@
+
+/* Basic Reset */
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+    font-family: 'Arial', sans-serif;
+}
+
+body {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    height: 100vh;
+    background-color: #f4f4f4;
+}
+
+#videoContainer {
+    position: relative;
+    width: 100%;
+    max-width: 640px;
+    margin-bottom: 20px;
+}
+
+/* #webcam {
+    width: 100%; 
+    max-width: 640px; 
+    border: 3px solid #333;
+    border-radius: 5px;
+    margin-bottom: 20px;
+} */
+
+#webcam {
+    display: block;
+    width: 100%; 
+    border: 3px solid #333;
+    border-radius: 5px;
+}
+
+#overlayCanvas {
+    position: absolute; 
+    top: 0;
+    left: 0;
+    width: 100%; 
+    height: 100%;
+    pointer-events: none;
+    z-index: 1;
+}
+
+#switchCam {
+    padding: 10px 20px;
+    background-color: #333;
+    color: #fff;
+    border: none;
+    border-radius: 5px;
+    cursor: pointer;
+    margin-bottom: 20px;
+    transition: background-color 0.3s;
+}
+
+#switchCam:hover {
+    background-color: #555;
+}
+
+#grayscaleCanvas {
+    border: 2px solid #999;
+    margin-bottom: 20px;
+}
+
+#prediction {
+    font-size: 24px;
+    color: #333;
+    margin-bottom: 20px;
+}
+
+#logitsGraph {
+    width: 100%;
+    max-width: 640px;
+    height: 300px;
+}
