@@ -2,6 +2,8 @@
 
 This is a simple demo of how to perform OCR on the client side using ONNX web.
 
+[try it out](https://colvertyety.github.io/bookish-octo-happiness/)
+
 # algorithm overview:
 
 1. train a small CNN with PyTorch on the EMNIST dataset.
