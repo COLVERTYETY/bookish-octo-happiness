@@ -8,10 +8,12 @@ const index_to_char = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9',
 'A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L', 'M', 'N', 'O', 'P', 'Q', 'R', 'S', 'T', 'U', 'V', 'W', 'X', 'Y', 'Z',
 'a', 'b', 'd', 'e', 'f', 'g', 'h', 'n', 'q', 'r', 't'];
 
+const thresholds = [9.773934364318848, 8.293187141418457, 9.934375762939453, 9.294990539550781, 7.936954498291016, 9.735556602478027, 9.542527198791504, 8.289621353149414, 7.873318195343018, 9.031131744384766, 7.869201183319092, 9.827280044555664, 10.279926300048828, 9.418956756591797, 10.042513847351074, 9.778995513916016, 10.02375602722168, 7.918678283691406, 8.33338451385498, 9.777628898620605, 10.83350658416748, 9.13015365600586, 10.393794059753418, 9.665188789367676, 9.221426010131836, 7.717484474182129, 9.948719024658203, 8.8203706741333, 9.75184154510498, 7.705641269683838, 7.945072174072266, 8.790163040161133, 14.034773826599121, 7.585292816162109, 9.35817813873291, 9.742826461791992, 8.852142333984375, 8.373862266540527, 11.218235969543457, 8.813253402709961, 7.479157447814941, 9.36019515991211, 8.186284065246582, 9.505398750305176, 8.002181053161621, 7.964801788330078, 8.3523588180542];
+
 // Initialize ONNX model
 async function initModel() {
     model = new onnx.InferenceSession({ backendHint: 'webgl' });
-    await model.loadModel('./emnist_9684.onnx');
+    await model.loadModel('./emnist_8693.onnx');
 }
 
 // Get webcam access
@@ -236,14 +238,33 @@ async function predict(tempCanvas, boundingBox, margin) {
 
     // Create an ONNX Tensor from imageData
     const tensorInput = new onnx.Tensor(input, 'float32', [1, 1, 28, 28]);
+    // console.log(tensorInput);
 
     // Run model with Tensor
     const res = await model.run([tensorInput]);
+
     const output = res.values().next().value.data;
-    const max_index = output.indexOf(Math.max(...output));
-    if (output[max_index] < 5) {
+    const sum = output.reduce((a, b) => a + b, 0);
+    const normalized = output.map(x => x / sum);
+    console.log(normalized);
+    const max_index = normalized.indexOf(Math.max(...normalized));
+    if (normalized[max_index] < 0.1) {
         return -1;
     }
+    // const max_index = output.indexOf(Math.max(...output));
+    // if (output[max_index] < 2) {
+    //     return -1;
+    // }
+    // const output = res.values().next().value.data;
+    // const subbed = output.map((x, i) => x - thresholds[i]);
+    // console.log(subbed);
+    // const max_index = subbed.indexOf(Math.max(...subbed));
+    // if (subbed[max_index] < 0) {
+    //     return -1;
+    // }
+    // if (output[max_index] < thresholds[max_index]/10) {
+    //     return -1;
+    // }
     return index_to_char[max_index];
 }
 
@@ -265,8 +286,8 @@ async function inferenceLoop() {
     const filtered_clusterinfo = clusterinfo.filter(cluster => cluster.size > cut_off_min && cluster.size < cut_off_max);
     // console.log("There are " + filtered_clusterinfo.length + " clusters");
     var predictions = [];
+    const margin = 0.2;
     if (filtered_clusterinfo.length > 0) {
-        const margin = 0.1;
         // const predictions = filtered_clusterinfo.map(cluster => await predict(tempCanvas, cluster.boundingBox, margin));
         
         for (var i = 0; i < filtered_clusterinfo.length; i++) {
