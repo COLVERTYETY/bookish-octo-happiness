@@ -14,7 +14,10 @@ from torchsummary import summary
 import matplotlib.pyplot as plt
 from torch.utils.tensorboard import SummaryWriter
 import os
+from torch.ao.quantization import QuantStub, DeQuantStub
 from sklearn.metrics import roc_curve, auc
+from ptflops import get_model_complexity_info
+
 torch.backends.cudnn.benchmark = True
 
 LABELS = ['0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 
@@ -30,25 +33,27 @@ def random_noise(x):
     x = torch.clip(x + noise, 0, 1)
     return x
 
-Random_blur_or_sharp = v2.RandomChoice([
-    v2.RandomApply([v2.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0))], p=0.5),
-])
-
 train_transform = transforms.Compose([
     transforms.ToTensor(),
     # random_noise,
     transforms.RandomPerspective(),
-    transforms.RandomAffine(30, translate=(0.1, 0.1), scale=(1.3,1.3) ,shear=(0.2,0.2)),
+    transforms.RandomAffine(45, translate=(0.1, 0.3), scale=(0.8,1.5) ,shear=(0.1,0.3)),
+
     transforms.RandomAdjustSharpness(0.5),
     transforms.RandomAdjustSharpness(1.5),
-    # transforms.RandomRotation(45),
-    # transforms.RandomAffine(0, translate=(0.1, 0.1)),
-    # transforms.RandomHorizontalFlip(),
-    # transforms.RandomErasing(),
+
     transforms.RandomInvert(),
     myNorm,
-    # transforms.RandomHorizontalFlip(),
 ])
+
+cutmix = v2.CutMix(num_classes=47)
+mixup = v2.MixUp(num_classes=47)
+random_erase = v2.RandomErasing(ratio = (0.1, 0.1), value = 'random' )
+cutmix_or_mixup = v2.RandomChoice([cutmix, mixup, random_erase])
+
+
+def collate(batch):
+    return cutmix_or_mixup(*default_collate(batch))
 
 test_transform = transforms.Compose([
     transforms.ToTensor(),
@@ -57,127 +62,138 @@ test_transform = transforms.Compose([
 ])
 
 train_set = torchvision.datasets.EMNIST( root='./data', split='balanced', train=True, download=True, transform=train_transform)
-test_set = torchvision.datasets.EMNIST( root='./data', split='balanced', train=False, download=True, transform=test_transform)
+test_set = torchvision.datasets.EMNIST( root='./data', split='balanced', train=False, download=True, transform=train_transform)
 confidence_set = torchvision.datasets.FashionMNIST( root='./data', train=True, download=True, transform=test_transform)
-train_loader = DataLoader(train_set, batch_size=64, shuffle=True, num_workers=8, pin_memory=True, drop_last=True)
+train_loader = DataLoader(train_set, batch_size=64, shuffle=True, num_workers=8, pin_memory=True, drop_last=True, collate_fn=collate)
 test_loader = DataLoader(test_set, batch_size=64, shuffle=True, num_workers=8, pin_memory=True, drop_last=True)
 confidence_loader = DataLoader(confidence_set, batch_size=64, shuffle=True, num_workers=8, pin_memory=True, drop_last=True)
 
-# num_classes = train_set.num_classes
 # count the number of classes
 num_classes = 47
 # for _, label in tqdm.tqdm(train_set, desc='Counting classes'):
 #     if label > num_classes:
 #         num_classes = label
 # num_classes += 1
-print(num_classes)
 
 # model
 
 class CNBLock(nn.Module):
-    def __init__(self, dims, norm_shape, kernel_size=3, exp=4):
+    def __init__(self, dims, norm_shape, kernel_size=3, exp=4, norm = True, residual=False):
         super(CNBLock, self).__init__()
+        self.residual = residual
         self.dwconv = nn.Conv2d(dims, dims, kernel_size=kernel_size, padding=kernel_size//2, groups=dims)
-        # self.ln = nn.LayerNorm(norm_shape)
+        self.norm = norm
+        self.ln = nn.LayerNorm(norm_shape)
         self.expand = nn.Conv2d(dims, dims*exp, kernel_size=1)
-        self.act = nn.ELU()
+        self.act = nn.LeakyReLU()
         self.reduce = nn.Conv2d(dims*exp, dims, kernel_size=1)
 
     def forward(self, x):
         input_ = x
         x = self.dwconv(x)
-        # x = self.ln(x)
+        if self.norm:
+            x = self.ln(x)
         x = self.expand(x)
         x = self.act(x)
         x = self.reduce(x)
-        return x + input_
+        if self.residual: # not supported by quantization
+            x = x + input_
+        return x
     
 class ReduceBlock(nn.Module):
-    def __init__(self, in_dims, out_dims, norm_shape):
+    def __init__(self, in_dims, out_dims, norm_shape, norm=True):
         super(ReduceBlock, self).__init__()
-        # self.ln = nn.LayerNorm(norm_shape)
+        self.norm = norm
+        self.ln = nn.LayerNorm(norm_shape)
         self.conv = nn.Conv2d(in_dims, out_dims, kernel_size=2, padding=0, stride=2)
     
     def forward(self, x):
-        # x = self.ln(x)
+        if self.norm:
+            x = self.ln(x)
         x = self.conv(x)
         return x
     
 class StemBlock(nn.Module):
-    def __init__(self,in_dims, out_dims, ksize=3,exp=2):
+    def __init__(self,in_dims, out_dims, ksize=3, norm=True):
         super(StemBlock, self).__init__()
+        self.norm = norm
         self.mid_size = out_dims
         self.conv = nn.Conv2d(in_dims, self.mid_size, kernel_size=ksize, padding=ksize//2)
-        # self.ln = nn.LayerNorm([self.mid_size, 28, 28])
+        self.ln = nn.LayerNorm([self.mid_size, 28, 28])
         
     def forward(self, x):
         x = self.conv(x)
-        # x = self.ln(x)
+        if self.norm:
+            x = self.ln(x)
         return x
 
 class Model(nn.Module):
     def __init__(self, num_classes, ksize=3, exp=2):
         super(Model, self).__init__()
+        self.quant = QuantStub()
+        self.dequant = DeQuantStub()
         self.num_classes = num_classes
         self.ksize = ksize
         self.exp = exp
         self.layers = nn.Sequential(
         StemBlock(1, 32, ksize=5),
-        CNBLock(32, [32, 28, 28], ksize, exp),
-        # CNBLock(32, [32, 28, 28], ksize, exp),
+        nn.LeakyReLU(),
+
         ReduceBlock(32, 64, [32, 28, 28]),
         CNBLock(64, [64, 14, 14], ksize, exp),
-        # CNBLock(64, [64, 14, 14], ksize, exp),
+
         ReduceBlock(64, 128, [64, 14, 14]), 
         CNBLock(128, [128, 7, 7], ksize, exp),
-        # CNBLock(128, [128, 7, 7], ksize, exp),
-        # nn.ELU(),
-        nn.Conv2d(128, 256, kernel_size=7, groups=128),
-        nn.ELU(),
+        CNBLock(128, [128, 7, 7], ksize, exp),
+        CNBLock(128, [128, 7, 7], ksize, exp),
+
+        nn.Conv2d(128, 512, kernel_size=7, groups=128),
+        nn.LeakyReLU(),
         nn.Flatten(),
-        nn.Linear(256, num_classes),
+        nn.Linear(512, num_classes),
         )
     
     def forward(self, x):
-        return self.layers(x)
+        x = self.quant(x)
+        x = self.layers(x)
+        x = self.dequant(x)
+        return x
 
 class simple_cnn(nn.Module):
     def __init__(self, num_classes):
         super(simple_cnn, self).__init__()
         self.num_classes = num_classes
         self.layers = nn.Sequential(
-            StemBlock(1, 32, ksize=5),
-            CNBLock(32, [32, 28, 28], 3, exp=1),
-            nn.Dropout2d(0.1),
-            CNBLock(32, [32, 28, 28], 3, exp=2),
+            StemBlock(1, 32, ksize=5, norm=False),
+            CNBLock(32, [32, 28, 28], 3, exp=1, norm=False),
             nn.Dropout2d(0.1),
             nn.MaxPool2d(2),
             nn.Conv2d(32, 64, kernel_size=3, padding=1, groups = 32),
             nn.ELU(),
-            CNBLock(64, [32, 14, 14], 3, exp=1),
+            CNBLock(64, [32, 14, 14], 3, exp=1, norm=False),
             nn.Dropout2d(0.1),
-            CNBLock(64, [32, 14, 14], 3, exp=2),
+            CNBLock(64, [32, 14, 14], 3, exp=1, norm=False),
             nn.Dropout2d(0.1),
             nn.MaxPool2d(2),
             nn.Conv2d(64, 128, kernel_size=3, padding=1, groups = 64),
             nn.ELU(),
-            CNBLock(128, [128, 7, 7],3, exp=1),
+            CNBLock(128, [128, 7, 7],3, exp=1, norm=False),
             nn.Dropout2d(0.1),
-            CNBLock(128, [128, 7, 7],3, exp=2),
+            CNBLock(128, [128, 7, 7],3, exp=1, norm=False),
             nn.Dropout2d(0.1),
-            nn.Conv2d(128, 256, kernel_size=7, groups=128),
-            nn.ELU(),
+            nn.Conv2d(128, 512, kernel_size=7, groups=128),
+            nn.LeakyReLU(),
             nn.Flatten(),
             nn.Dropout(0.1),
-            nn.Linear(256, num_classes),
+            nn.Linear(512, num_classes),
         )
     
     def forward(self, x):
         return self.layers(x)
 
             
-# model = Model(num_classes, ksize=3, exp=2)
-model = simple_cnn(num_classes)
+model = Model(num_classes, ksize=3, exp=1) # 9.24 MMac 344.88 k
+# model = simple_cnn(num_classes) # 9.88 MMac 267.12 k
 
 summary(model, (1, 28, 28), device='cpu')
 
@@ -188,8 +204,8 @@ model = model.to(device)
 criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
 optimizer = optim.Adam(model.parameters(), lr=1e-4)
 # use onecyle lr scheduler
-epochs = 30
-scheduler = optim.lr_scheduler.OneCycleLR(optimizer, max_lr=2e-3, steps_per_epoch=len(train_loader), epochs=epochs)
+epochs = 100
+scheduler = optim.lr_scheduler.OneCycleLR(optimizer, max_lr=1e-3, steps_per_epoch=len(train_loader), epochs=epochs)
 writer = SummaryWriter()
 
 def train(model, train_loader, optimizer, scheduler, criterion, device):
@@ -204,6 +220,8 @@ def train(model, train_loader, optimizer, scheduler, criterion, device):
         outputs = model(images)
         loss = criterion(outputs, labels)
         _, predicted = torch.max(outputs.data, 1)
+        if labels.ndim >1: # for cutmix mixed labels
+            labels = labels.argmax(1)
         correct += (predicted == labels).sum().item()
         total += labels.size(0)
         running_loss += loss.item()
@@ -241,20 +259,20 @@ def compute_roc(model, test_loader, confidence_loader, device):
         # First, get outputs for positive samples
         for images, labels in tqdm.tqdm(test_loader):
             images, labels = images.to(device), labels.to(device)
-            outputs = model(images)
+            outputs = torch.softmax(model(images), dim=1)  # Apply softmax
             all_outputs.extend(outputs.cpu().numpy())
             all_labels.extend(labels.cpu().numpy())
 
         # Next, get outputs for negative samples (from the confidence_loader)
         for images, _ in tqdm.tqdm(confidence_loader):
             images = images.to(device)
-            outputs = model(images)
+            outputs = torch.softmax(model(images), dim=1)  # Apply softmax
             all_outputs.extend(outputs.cpu().numpy())
             all_labels.extend([-1 for _ in range(images.size(0))])
     
     return all_labels, all_outputs
 
-def compute_thresholds(all_labels, all_outputs):
+def compute_thresholds(all_labels, all_outputs, num_classes):
     thresholds = []
     for i in range(num_classes):
         labels_i = [1 if label == i else 0 for label in all_labels]
@@ -268,20 +286,19 @@ def compute_thresholds(all_labels, all_outputs):
 
 def test_thresholds(model, test_loader, thresholds, device):
     model.eval()
-    running_loss = 0
     correct = 0
     total = 0
     thresholds = torch.tensor(thresholds).to(device)
     with torch.no_grad():
-        for i, (images, labels) in enumerate(tqdm.tqdm(test_loader)):
+        for images, labels in tqdm.tqdm(test_loader):
             images = images.to(device)
             labels = labels.to(device)
-            outputs = model(images)
-            prediction = (outputs - thresholds).argmax(1)
+            outputs = torch.softmax(model(images), dim=1)  # Apply softmax
+            prediction = (outputs - thresholds.unsqueeze(0)).argmax(1)
             correct += (prediction == labels).sum().item()
             total += labels.size(0)
 
-    return correct/total
+    return correct / total
 
 def plot_confusion_matrix(y_true, y_pred, classes,
                             normalize=False,
@@ -352,15 +369,51 @@ def compute_confusion_matrix(model, test_loader, device):
     all_predictions = all_outputs.argmax(1)
     plot_confusion_matrix(all_labels, all_predictions, np.arange(num_classes), normalize=True)
 
-def to_onnx_web(model, acc):
-    model.eval()
-    model= model.cpu()
+def to_onnx_web(model, acc, test_loader=None):
+    model_ = model
+    model_.eval()
+    model_= model_.cpu()
+    if test_loader!=None:
+        # quantize with torch before export.
+        backend = 'qnnpack' # or 'x86'
+        model_.qconfig = torch.quantization.get_default_qconfig(backend)
+        torch.backends.quantized.engine = backend
+        torch.quantization.prepare(model_, inplace=True)
+        acc=0
+        with torch.no_grad():
+            for images, labels in tqdm.tqdm(test_loader):
+                images = images.cpu()
+                labels = labels.cpu()
+                outputs = model_(images)
+                _, predicted = torch.max(outputs.data, 1)
+                acc += (predicted == labels).sum().item()
+        print('Accuracy before quantization: ', acc/len(test_loader.dataset))
+        torch.quantization.convert(model_, inplace=True)
+        print(model_)
+        with torch.no_grad():
+            acc=0
+            for images, labels in tqdm.tqdm(test_loader):
+                images = images
+                labels = labels
+                outputs = model_(images)
+                _, predicted = torch.max(outputs.data, 1)
+                acc += (predicted == labels).sum().item()
+        acc = int(acc/len(test_loader.dataset)*10000)
+        print('Accuracy after quantization: ',acc)
     dummy_input = torch.randn(1, 1, 28, 28, requires_grad=True)
-    torch.onnx.export(model, dummy_input, f"emnist_{acc}.onnx", verbose=False, input_names=['input'], output_names=['output'], opset_version=9, dynamic_axes={'input': {0: 'batch_size'}, 'output': {0: 'batch_size'}})
-    print('Exported to onnx', f"emnist_{acc}.onnx")
+    torch.onnx.export(model_, dummy_input, f"emnist_{acc}.onnx", verbose=False, input_names=['input'], output_names=['output'], opset_version=13, dynamic_axes={'input': {0: 'batch_size'}, 'output': {0: 'batch_size'}})
+    print(f'Exported to onnx !! emnist_{acc}.onnx')
+
+
+def compute_flops(model):
+    macs, params = get_model_complexity_info(model, (1, 28, 28), as_strings=True,
+                                           print_per_layer_stat=True, verbose=True)
+    print('{:<30}  {:<8}'.format('Computational complexity: ', macs))
+    print('{:<30}  {:<8}'.format('Number of parameters: ', params))
 
 def main():
-    to_onnx_web(model, 0)
+    # to_onnx_web(model, 0, test_loader)
+    compute_flops(model)
     model.cuda()
     best_loss = 1e10
     for epoch in range(epochs):
@@ -379,7 +432,7 @@ def main():
     model.load_state_dict(torch.load('emnist_best.pth'))
     compute_confusion_matrix(model, test_loader, device)
     all_labels, all_outputs = compute_roc(model, test_loader, confidence_loader, device)
-    thresholds = compute_thresholds(all_labels, all_outputs)
+    thresholds = compute_thresholds(all_labels, all_outputs, num_classes)
     # save thresholds
     print('avg threshold: ', np.mean(thresholds))
     print('std threshold: ', np.std(thresholds))
@@ -396,7 +449,7 @@ def main():
     writer.flush()
     writer.close()
     # torch.save(model.state_dict(), 'emnist.pth')
-    to_onnx_web(model, acc)
+    to_onnx_web(model, acc, test_loader)
 
 if __name__ == '__main__':
     main()

@@ -12,9 +12,27 @@ const thresholds = [9.773934364318848, 8.293187141418457, 9.934375762939453, 9.2
 
 // Initialize ONNX model
 async function initModel() {
-    model = new onnx.InferenceSession({ backendHint: 'webgl' });
-    await model.loadModel('./emnist_8693.onnx');
+    // model = new ort.InferenceSession({ backendHint: 'webgl' });
+    model = await ort.InferenceSession.create("./emnist_8693.onnx");
+    // await model.loadModel('./emnist_8693.onnx');
 }
+
+var image_list = [];
+
+var tensors = [];
+//  mouse info
+var mouseX=0;
+var mouseY=0;
+let lastClickTime = Date.now();
+
+// Update mouse info on click
+video.addEventListener('click', function(event) {
+    const rect = video.getBoundingClientRect();
+    mouseX = event.clientX - rect.left;
+    mouseY = event.clientY - rect.top;
+    lastClickTime = Date.now();
+    console.log(mouseX, mouseY, lastClickTime);
+});
 
 // Get webcam access
 async function getWebcam(streamName = 'user') {
@@ -33,7 +51,7 @@ async function getWebcam(streamName = 'user') {
 
     video.onloadedmetadata = function() {
         video.play();
-        inferenceLoop();
+        inferenceLoop();    
     };
 }
 
@@ -209,7 +227,47 @@ function preprocessFrame(k = 1) {
     return imageData;
 }
 
-async function predict(tempCanvas, boundingBox, margin) {
+async function downloadTensor(tensor) {
+    // Assuming 'tensor' is an ONNX tensor and 'tensor.data' is the method to get the actual data as a typed array.
+    // If 'tensor.data' is not the correct method, replace it with the actual method to get the data from your ONNX tensor.
+    console.log("in dowload, ", tensor)
+    const tensorData = tensor.data; // Make sure this is an asynchronous call if necessary
+
+    // Convert the typed array to a string (for example, by joining values with a newline character)
+    const tensorDataString = Array.from(tensorData).join('\n');
+
+    // Convert the string to a Blob
+    const blob = new Blob([tensorDataString], { type: 'text/plain' });
+
+    // Rest of your download logic...
+    const url = window.URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'tensor_data.txt';
+    document.body.appendChild(a);
+    a.click();
+    document.body.removeChild(a);
+    window.URL.revokeObjectURL(url);
+}
+
+async function predict(tempCanvas, boundingBox, margin, square=false) {
+
+    if (square) {
+        // Calculate width and height of bounding box
+        const width = boundingBox.maxX - boundingBox.minX;
+        const height = boundingBox.maxY - boundingBox.minY;
+        
+        // Determine the larger dimension and square the bounding box
+        const maxDim = Math.max(width, height);
+        const halfDiffWidth = (maxDim - width) / 2;
+        const halfDiffHeight = (maxDim - height) / 2;
+
+        boundingBox.minX -= halfDiffWidth;
+        boundingBox.maxX += halfDiffWidth;
+        boundingBox.minY -= halfDiffHeight;
+        boundingBox.maxY += halfDiffHeight;
+    }
+
     // Resize the bounding box
     const marginX = Math.floor((boundingBox.maxX - boundingBox.minX) * margin);
     const marginY = Math.floor((boundingBox.maxY - boundingBox.minY) * margin);
@@ -228,44 +286,40 @@ async function predict(tempCanvas, boundingBox, margin) {
 
     croppedCtx.drawImage(tempCanvas, boundingBox.minX, boundingBox.minY, croppedWidth, croppedHeight, 0, 0, 28, 28);
 
+    
+
     // Extract image data from resized canvas
     const croppedImageData = croppedCtx.getImageData(0, 0, 28, 28);
-    const input = new Float32Array(28 * 28);
+    const input_ = new Float32Array(28 * 28);
     for (let i = 0; i < croppedImageData.data.length; i += 4) {
         // Since it's already grayscale, we can simply normalize using the red channel (or any single channel since they are all the same in grayscale)
-        input[i / 4] = croppedImageData.data[i] > 127 ? 0.5 : -0.5;
+        input_[i / 4] = croppedImageData.data[i] > 127 ? 0.5 : -0.5;
     }
+    // var thestring = "";
+    // for (let i = 0; i < input.length; i++) {
+    //     thestring += input[i].toString() + ", ";
+    // }
+    // console.log(thestring);
 
     // Create an ONNX Tensor from imageData
-    const tensorInput = new onnx.Tensor(input, 'float32', [1, 1, 28, 28]);
-    // console.log(tensorInput);
-
+    const tensorInput = new ort.Tensor('float32', input_,[ 1, 1, 28, 28]);
+    // console.log("in predict", tensorInput);
     // Run model with Tensor
-    const res = await model.run([tensorInput]);
+    const res = await model.run({'input':tensorInput});
 
-    const output = res.values().next().value.data;
-    const sum = output.reduce((a, b) => a + b, 0);
-    const normalized = output.map(x => x / sum);
-    console.log(normalized);
+    // const output = res.values().next().value.data;
+    const output = res.output.data;
+    // const sum = output.reduce((a, b) => a + b, 0);
+    //  normalize using softmax
+    const sum = output.reduce((a, b) => a + Math.exp(b), 0);
+    const normalized = output.map(x => Math.exp(x) / sum);
+    // console.log(Math.max(...normalized));
     const max_index = normalized.indexOf(Math.max(...normalized));
+    // console.log(normalized[max_index])
     if (normalized[max_index] < 0.1) {
         return -1;
     }
-    // const max_index = output.indexOf(Math.max(...output));
-    // if (output[max_index] < 2) {
-    //     return -1;
-    // }
-    // const output = res.values().next().value.data;
-    // const subbed = output.map((x, i) => x - thresholds[i]);
-    // console.log(subbed);
-    // const max_index = subbed.indexOf(Math.max(...subbed));
-    // if (subbed[max_index] < 0) {
-    //     return -1;
-    // }
-    // if (output[max_index] < thresholds[max_index]/10) {
-    //     return -1;
-    // }
-    return index_to_char[max_index];
+    return [index_to_char[max_index], tensorInput];
 }
 
 // Inference loop
@@ -291,17 +345,34 @@ async function inferenceLoop() {
         // const predictions = filtered_clusterinfo.map(cluster => await predict(tempCanvas, cluster.boundingBox, margin));
         
         for (var i = 0; i < filtered_clusterinfo.length; i++) {
-            predictions.push(await predict(tempCanvas, filtered_clusterinfo[i].boundingBox, margin));
+            const res = await predict(tempCanvas, filtered_clusterinfo[i].boundingBox, margin);
+            predictions.push(res[0]);
+            if((Date.now() - lastClickTime) < 100){
+                // check collision 
+                const { boundingBox } = filtered_clusterinfo[i];
+                const scaledMinX = boundingBox.minX * k;
+                const scaledMinY = boundingBox.minY * k;
+                const scaledMaxX = boundingBox.maxX * k;
+                const scaledMaxY = boundingBox.maxY * k;
+                // Check if the click is within any bounding box
+                if (mouseX >= scaledMinX && mouseX <= scaledMaxX && mouseY >= scaledMinY && mouseY <= scaledMaxY) {
+                    tensors.push(res[1]);
+                    // console.log("in Q", tensors[tensors.length-1]);
+                    downloadTensor(tensors[tensors.length-1]);
+                }
+            }
         }
         predictionText.innerHTML = predictions;
-        console.log(predictions);
+        // console.log(predictions);
+        //  check clickTime
+        
     }
     drawBoundingBoxes(filtered_clusterinfo, predictions, k);
 
     const now = Date.now();
     const fps = 1000 / (now - (window.lastInferenceTime || now));
     window.lastInferenceTime = now;
-    console.log(`FPS: ${fps.toFixed(2)}`);
+    // console.log(`FPS: ${fps.toFixed(2)}`);
 
     requestAnimationFrame(inferenceLoop);
 }

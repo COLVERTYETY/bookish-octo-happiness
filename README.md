@@ -12,9 +12,11 @@ This is a simple demo of how to perform OCR on the client side using ONNX web.
 
 2. Find optimal threshold for class confidence using AUC-ROC with FASHIONMNIST as negative class.
 
-3. convert the trained model to ONNX format.
+3. quantize the trained model to 8-bit integer.
 
-4. load the ONNX model in a web browser and perform inference on the client side:
+4. convert the trained model to ONNX format.
+
+5. load the ONNX model in a web browser and perform inference on the client side:
    1. Binarize the image.
    2. perform clustering via flood fill algorithm.
    3. extract the bounding boxes of the clusters.
